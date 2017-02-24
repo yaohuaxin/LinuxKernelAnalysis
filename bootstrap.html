@@ -1,0 +1,851 @@
+	I Bootstrap
+	1 汇编代码分析
+
+	2 start_kernel函数
+
+	3 准备进入用户态
+	3.1 Initrd初始化
+	3.1.0 准备知识
+在讲述如何释放initrd到rootfs之前，有比较讲述一下什么是rootfs，rootfs的初始化相关的函数；以及rootfs的初始化函数是如何被调用的。
+这里所说的rootfs指的是VFS的根节点/，以及在内存中创建的根目录/下的文件和目录节点，这个文件系统仅仅存在于内存之中，由内核初始化的时候负责创建，该文件系统不会存储到其它非易失性介质上。该rootfs文件系统mnt_init函数调用init_rootfs和init_mount_tree两个函数来负责创建和初始化：
+
+void __init mnt_init(void)
+{
+	......
+	//这个函数很简单，就是注册了rootfs 的文件系统。
+	init_rootfs();
+//在这里，将rootfs 文件系统挂载，它的挂载点默认为”/”。
+//最后切换进程的根目录和当前目录为”/”，这也就是根目录的由来。
+//不过这里只是初始化，等挂载完具体的文件系统之后，
+//一般都会将根目录切换到具体的文件系统，所以在系统启动之后，
+//用mount 命令是看不到rootfs 的挂载信息的。
+	init_mount_tree();
+}
+
+有了rootfs后，就可以将initrd的image释放到rootfs中了，至于哪个函数完成这项工作？在讲述该函数之前，我们首先看看该函数是如何被调用的。首先看kernel_init函数中的do_basic_setup函数：
+
+static int __init kernel_init(void * unused)
+{
+	......
+	
+	do_basic_setup();
+
+}
+
+
+do_basic_setup()是一个很关键的函数，所有直接编译在kernel 中的模块都是由它启动的。
+
+/*
+ * Ok, the machine is now initialized. None of the devices
+ * have been touched yet, but the CPU subsystem is up and
+ * running, and memory and process management works.
+ *
+ * Now we can finally start doing some real work..
+ */
+//注意上面的关于该函数的注释：CPU和进程管理模块已经正常工作，但是外设还没初始化。
+static void __init do_basic_setup(void)
+{
+	cpuset_init_smp();
+	usermodehelper_init();
+	init_tmpfs();
+	driver_init();
+	init_irq_proc();
+	do_ctors();
+//启动所有在__initcall_start 和__initcall_end 段的函数，
+//而静态编译进内核的modules 也会将其入口放置在这段区间里。
+	do_initcalls();
+}
+
+将initrd的image释放到rootfs中的工作是由populate_rootfs函数完成，该函数由rootfs_initcall（）所引用。注意到有以下初始化函数：
+rootfs_initcall(populate_rootfs);
+如此：也就是说会在系统初始化的时候，也就是do_initcalls被调用的时候，会调用populate_rootfs 进行初始化。
+	3.1.1 释放initrd
+总的来说，rootfs 分为两种：虚拟rootfs 和真实rootfs。现在kernel 的发展趋势是将更多的功能放到用户空间完成，以保持内核的精简。虚拟rootfs 也是各linux 发行厂商普遍采用的一种方式，可以将一部份的初始化工作放在虚拟的rootfs 里完成，然后切换到真实的文件系统。在虚拟rootfs 的发展过程中，又有以下几个版本：
+Initramfs：Initramfs 是在kernel 2.5中引入的技术，实际上它的含义就是：在内核镜像中附加一个cpio 包，这个cpio包中包含了一个小型的文件系统，当内核启动时，内核将这个cpio 包解开，并且将其中包含的文件系统释放到rootfs 中，内核中的一部分初始化代码会放到这个文件系统中，作为用户层进程来执行。这样带来的明显的好处是精简了内核的初始化代码，而且使得内核的初始化过程更容易定制。这种这种方式的rootfs 是包含在kernel image 之中的。
+cpio-initrd: cpio 格式的rootfs
+image-initrd:传统格式的rootfs
+将在下文具体讲述这两种initrd。
+
+populate_rootfs代码如下：
+
+/*
+ * 处理Initramfs/cpio-initrd/image-initrd三个格式的image。
+ * 主要功能实现了将Initramfs/cpio-initrd两种格式的image释放到rootfs；
+ * 不同不出image-initrd这种老式的initrd格式，需要依赖其它手段，后续会讲。
+ */
+static int __init populate_rootfs(void)
+{
+	/*
+	 * 第一种情况是跟kernel融为一体的initramfs， 从内核2.5引入这种技术。在编译kernel的时候，通过链接脚本
+	 * 将其存放在__initramfs_start 至__initramfs_end 的区域。这种情况下，
+	 * 直接调用unpack_to_rootfs 将其释放到根目录/。
+	 *
+	 * 如果不是属于initramfs这种形式的，也就是__initramfs_start 和 __initramfs_end 的值相等，
+	 * 长度为零，不会做任何处理，退出；err此时也为NULL。
+	 */
+	char *err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
+	if (err)
+		panic(err);	/* Failed to decompress INTERNAL initramfs */
+
+	/*
+	 * 紧接着处理initrd格式，而initrd又有两种格式：Image-initrd和CPIO-initrd。
+	 * 由initrd_start变量是否为0，来判断内核是否接受了参数：“initrd=”，如果有参数“initrd=”，
+	 * 由下面的代码对initrd进行处理，处理过程又根据initrd的两种格式而不尽相同：
+	 * CPIO-initrd：会被直接释放到rootfs；
+	 * Image-initrd：暂时不会被释放到rootfs，而是将initrd image拷贝到/initrd.image文件中。
+	 */
+	if (initrd_start) {
+		/*
+		 * 必须要配制CONFIG_BLK_DEV_RAM 才会支持image-initrd。否则全当成cpio-initrd 的形式处理。
+		 */
+#ifdef CONFIG_BLK_DEV_RAM
+		int fd;
+		printk(KERN_INFO "Trying to unpack rootfs image as initramfs...\n");
+		err = unpack_to_rootfs((char *)initrd_start, initrd_end - initrd_start);
+
+		//如果unpack_to_rootfs返回正常
+		if (!err) {
+			free_initrd();
+			return 0;
+		} else {
+			//如果释放initrd到根目录发生错误，重新释放initramfs。
+			clean_rootfs();
+			unpack_to_rootfs(__initramfs_start, __initramfs_size);
+		}
+		printk(KERN_INFO "rootfs image is not initramfs (%s)"
+				"; looks like an initrd\n", err);
+		fd = sys_open((const char __user __force *) "/initrd.image", O_WRONLY|O_CREAT, 0700);
+
+		/*
+		 * 将initrd写入/initrd.image文件
+		 * 看上去image-initrd和cpio-initrd两种格式的image都会被写入/initrd.image
+		 * 这看上去不太合理，因为unpack_to_rootfs能够正确处理cpio-initrd，就不需要
+		 * 拷贝到/initrd.image了；其实内核是根据是否配置 CONFIG_BLK_DEV_RAM来
+		 * 判断是否支持image-initrd，如果不支持image-initrd，就不要配置 CONFIG_BLK_DEV_RAM，
+		 * 内核就会编译下面的宏定义段内代码，就不会拷贝initrd到/initrd.image了。
+		 */
+		if (fd >= 0) {
+			sys_write(fd, (char *)initrd_start, initrd_end - initrd_start);
+			sys_close(fd);
+			/*
+			 * 对于是image-initrd 的情况。将其释放到/initrd.image.
+			 * 最后将initrd 内存区域归入伙伴系统。这段内存就可以由操作系统来做其它的用途了。
+			 */
+			free_initrd();
+		}
+#else
+		printk(KERN_INFO "Unpacking initramfs...\n");
+		err = unpack_to_rootfs((char *)initrd_start,
+			initrd_end - initrd_start);
+		if (err)
+			printk(KERN_EMERG "Initramfs unpacking failed: %s\n", err);
+		free_initrd();
+#endif
+	}
+	return 0;
+}
+rootfs_initcall(populate_rootfs);
+/*
+ * 正确，返回NULL；否则返回一个C语言格式字符串。
+ *
+ * 顾名思义就是解压包，并将其释放至rootfs。
+ * 在这个函数里，对应如下的三种虚拟根文件系统的情况：
+ * Initramfs 是在kernel 2.5中引入的技术，实际上它的含义就是：在内核镜像中附加一个cpio 包，这个cpio
+ * 包中包含了一个小型的文件系统，当内核启动时，内核将这个cpio 包解开，并且将其中包含的文件系
+ * 统释放到rootfs 中，内核中的一部分初始化代码会放到这个文件系统中，作为用户层进程来执行。这样
+ * 带来的明显的好处是精简了内核的初始化代码，而且使得内核的初始化过程更容易定制。这种这种方
+ * 式的rootfs 是包含在kernel image 之中的.
+ * cpio-initrd: cpio 格式的rootfs
+ * image-initrd:传统格式的rootfs
+ * 关于这两种虚拟文件系统，请参考后续章节。
+ *
+ *===========================================================================
+ * 一种是跟kernel 融为一体的initramfs， 在编译kernel的时候，通过链接脚本
+ * 将其存放在__initramfs_start 至__initramfs_end 的区域。这种情况下，
+ * 直接调用unpack_to_rootfs 将其释放到根目录。
+ * 如果不是属于这种形式的，也就是__initramfs_start 和 __initramfs_end 的值相等，
+ * 长度为零。不会做任何处理，退出。
+ * 对应后两种情况，image-initrd不会被释放到rootfs，该格式的处理细节后文继续讲解；
+ * 也就是说unpack_to_rootfs不能正确处理image-initrd，需要依赖其它手段。
+ * 对于是cpio-initrd 的情况，直接将其释放到根目录。
+ */
+static char * __init unpack_to_rootfs(char *buf, unsigned len)
+{
+	int written, res;
+	decompress_fn decompress;
+	const char *compress_name;
+	static __initdata char msg_buf[64];
+
+	header_buf = kmalloc(110, GFP_KERNEL);
+	symlink_buf = kmalloc(PATH_MAX + N_ALIGN(PATH_MAX) + 1, GFP_KERNEL);
+	name_buf = kmalloc(N_ALIGN(PATH_MAX), GFP_KERNEL);
+
+	if (!header_buf || !symlink_buf || !name_buf)
+		panic("can't allocate buffers");
+
+	state = Start;
+	this_header = 0;
+	message = NULL;
+	while (!message && len) {
+		loff_t saved_offset = this_header;
+		if (*buf == '0' && !(this_header & 3)) {
+			state = Start;
+			written = write_buffer(buf, len);
+			buf += written;
+			len -= written;
+			continue;
+		}
+		if (!*buf) {
+			buf++;
+			len--;
+			this_header++;
+			continue;
+		}
+		this_header = 0;
+		decompress = decompress_method(buf, len, &compress_name);
+		if (decompress) {
+			res = decompress(buf, len, NULL, flush_buffer, NULL,
+				   &my_inptr, error);
+			if (res)
+				error("decompressor failed");
+		} else if (compress_name) {
+			if (!message) {
+				snprintf(msg_buf, sizeof msg_buf,
+					 "compression method %s not configured",
+					 compress_name);
+				message = msg_buf;
+			}
+		} else
+			error("junk in compressed archive");
+		if (state != Reset)
+			error("junk in compressed archive");
+		this_header = saved_offset + my_inptr;
+		buf += my_inptr;
+		len -= my_inptr;
+	}
+	dir_utime();
+	kfree(name_buf);
+	kfree(symlink_buf);
+	kfree(header_buf);
+	return message;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	3.2 initrd
+到目前为止，initrd技术虽然是一种比较过时但还是一种比较常用的技术。Linux Kernel2.6的initrd的文件系统镜像文件变成了cpio格式；变化不仅仅体现在文件格式上，内核对这两个格式的initrd有着截然不同的处理方法。本节首先介绍什么是initrd技术，然后介绍了3.0内核的initrd的处理流程。
+
+Initrd的含义是bootloader initialized RAM Disk，就是由bootloader初始化的内存盘。在Linux内核启动之前，bootloader会将存储介质中的initrd文件加载到内存，内核启动时会在加载rootfs之前首先访问内存中的initrd文件系统。在bootloader配置了initrd的情况下，内核启动被分为两个阶段：第一阶段首先执行initrd中的某个文件（/linuxrc或者/init，下文会详细讲），文成一些特定的任务，如加载RAID驱动等；第二阶段才是真正执行rootfs中的/sbin/init，以启动init进程。
+
+Initrd主要有以下四个优势：
+1 动态适应底层硬件平台：Linux发行版必须支持各种各样的底层平台，将所有的驱动都编译进内核是不太现实的，而且内核会常驻内存，这也会造成内存资源的极大浪费。Linux发行版的内核中只会包含最基本的一些驱动；而通过在安装过程中检测系统硬件，动态生成底层平台依赖的initrd无非是一种既可行又灵活的解决方案。
+2 用于LiveCD：LiveCD可能面对复杂的硬件环境，所以也必须使用initrd。
+3 制作USB启动盘时必须使用initrd：USB设备是一个启动比较慢的设备，从驱动加载到设备真正可用大概需要几秒的时间。如果将USB驱动编译进内核，内核通常不能正确访问USB中的文件系统，因为内核访问USB时，USB设备还没有初始化完毕。所以通常的做法是：在initrd中加载USB驱动，然后休眠几秒钟，等待USB设备初始化完毕后再去挂载USB中的文件系统。
+4 initrd（脚本）很灵活，而且是工作在用户态，可以在其中很方便的定制一些功能，如系统安全相关的设置。
+
+在深入介绍内核2.6及其以后版本使用的initrd机制之前，先简单介绍内核2.4中的initrd机制。内核2.4中的initrd的文件格式是一个文件系统镜像文件，姑且称之为image-initrd，以区分内核2.6及其以后的CPIO格式的initrd。内核2.4对initrd的处理流程如下：
+1 bootloader将内核和initrd两个image加载到内存，经过一些必要的初始化后，将控制权交给内核；
+2 内核经过一些进一步的初始化后，将initrd所在的内存区域（由bootloader告知内核）设置为/dev/initrd设备；然后kernel 透过 内部的 decompressor (gzip 解压缩) 解开该内容并复制到 /dev/ram0 装置设备上；
+3 内核以 R/W (可读写) 模式将 /dev/ram0 挂载为暂时性的 rootfs；
+4 kernel 准备执行 /dev/ram0 上的 /linuxrc ，该程序（脚本）是在用户态执行的；如果 /dev/ram0 被指定为真正的根文件系统，那么内核跳至第7步正常启动；
+5 /linuxrc与相关程序处理特定的操作；linuxrc 通常是一个脚本文件，负责加载内核访问根文件系统必须的驱动，以及加载根文件系统；
+6 /linuxrc 执行即将完毕，执行权转交给 kernel；如果rootfs中存在 /initrd 目录，那么 /dev/ram0 将从 / 移动到 /initrd。否则如果 /initrd 目录不存在， /dev/ram0 将被卸载。
+7 Linux 挂载真正的 rootfs 并执行 /sbin/init 程式
+8 依据 Linux distribution 规范的流程，执行各式系统与应用程式；linux2.4 内核的 initrd 的执行是作为内核启动的一个中间阶段，也就是说 initrd 的 /linuxrc 执行以后，内核会继续执行初始化代码，我们后面会看到这是 linux2.4 内核同 2.6 内核的 initrd 处理流程的一个显著区别。
+
+内核2.6支持两种格式的initrd，一种是前面提到的传统格式个image-initrd，其核心文件是/linuxrc；另外一种格式是CPIO，这种格式从内核2.5开始引入，使用CPIO工具生成，其核心文件是/init，姑且称这种initrd为CPIO-initrd。尽管内核2.6对image-initrd和CPIO-initrd都有支持，但处理流程却有着显著的区别。下面分别介绍内核2.6对这两种格式的initrd的处理流程：
+CPIO-initrd的处理流程：
+1 Bootloader将内核initrd加载到内存特定位置；
+2 内核判断initrd是否是CPIO格式，如果是：
+3 将initrd的内容释放到rootfs中；
+4 执行initrd中的/init文件；
+5 执行完/init后，控制权再交给内核
+
+Image-initrd的处理流程：
+1 Bootloader将内核initrd加载内存特定位置；
+2 内核判断initrd格式，如果不是CPIO格式，则作为Image-initrd格式处理；
+3 将initrd的内容保存在rootfs的/initrd.image文件中；
+4 将/initrd.image中的内容读入到/dev/ram0中，也就是读入了一个内存盘中；
+5 接着内核以读写的方式将/dev/ram0挂载原始的根文件系统；
+6 如果/dev/ram0被指定为rootfs，跳转到最后一步进行正常启动；
+7 执行/linuxrc文件，linuxrc通常是一个脚本，负责加载根文件需要的驱动，以及加载根文件系统；
+8 /linuxrc执行完毕，控制权交给内核，常规跟文件系统被挂载；
+9 如果常规根文件系统中存在/initrd目录，那么/dev/ram0将从/移动到/initrd；否则如果/initrd不存在，/dev/ram0将被卸载；
+10 在rootfs上进行启动，执行/sbin/init。
+
+通过上面的流程可知，内核2.6对image-initrd的处理流程相较内核2.4并无明显变化；CPIO-image相较image-initrd有很大差别，流程非常简单。
+
+CPIO-image相较image-initrd，有一些区别和优势：
+1 CPIO-initrd的制作比较简单，通过以下两个命令即可完成：
+#假设当前目录位于准备好的initrd文件系统的根目录下
+bash# find . | cpio -c -o > ../initrd.img
+bash# gzip ../initrd.img
+
+而image-initrd的制作相对繁琐：
+#假设当前目录位于准备好的initrd文件系统的根目录下
+bash# dd if=/dev/zero of=../initrd.img bs=512k count=5
+bash# mkfs.ext2 -F -m0 ../initrd.img
+bash# mount -t ext2 -o loop ../initrd.img /mnt
+bash# cp -r * /mnt
+bash# umount /mnt
+bash# gzip -9 ../initrd.img
+
+2 CPIO-image的内核处理流程简单
+通过上面的对CPIO-initrd处理流程的介绍，CPIO-initrd的处理流程也显得格外简单，CPIO-initrd主要在以下两个方面做了简化：
+a CPIO-image并没有使用额外的RamDisk，这样就省略了RamDisk的挂载和卸载工作；
+b CPIO-initrd启动完/init进程，内核任务就结束了，剩下的工作都交给/init处理；而对于image-initrd，内核在执行完/linuxrc之后，还需要等待其结束，再进行一些收尾工作，并且需要负责执行rootfs中的/sbin/init。可以通过下面的简化的流程图更加清晰表示两者之间的区别：
+
+
+
+
+CPIO-initrd的职能更加重要，不再像image-initrd那样是Linux启动过程的一个中间步骤，而是作为内核启动的终极步骤，内核将控制权交给/init后就完了，所以CPIO-initrd可以做更多的工作，而不需要担心和内核后续处理的衔接问题。
+
+	3.2.2 内核2.6 Initrd处理代码分析
+下面对内核2.6中与initrd相关的代码进行详细分析。首先阐述几个相关的概念；
+rootfs：一个驻留在内存中的文件系统，也是Linux初始化时构建的第一个文件系统，其实VFS。
+initramfs：和本文的主题关系不是太大，但是代码涉及到了initramfs，为了更好地理解代码，对其做简单介绍。Initramfs是内核2.5引入的技术，它的实际含义是，内核镜像中附加一个CPIO包，该CPIO包中包含了一个小型的文件系统，当内核启动的时候，内核将包解开，并且将其中包含的文件系统释放到rootfs中。内核中的一部分初始化代码会放到这个文件系统中，作为用户态程序来运行。这样明显的好处是简化了内核的初始化代码，而且使得内核的初始化过程更加容易定制。Linux内核2.6.12中的initramfs还没有什么实质性的内容，一个完整的initramfs的实现还需要一个漫长的过程。
+realfs：用户最终使用文件系统。
+
+内核初始化代码起始于start_kernel，和initrd相关的代码起始于kernel_init，下图列出了跟该initrd相关的函数调用关系：
+
+
+
+
+首先从kernel_init函数开始分析，我们省略了该函数中跟initrd无关的代码。
+static int __init kernel_init(void * unused)
+{
+	//省略跟initrd无关的部分
+	
+	if (!ramdisk_execute_command)
+		ramdisk_execute_command = "/init";
+
+	if (sys_access((const char __user *) ramdisk_execute_command, 0) != 0) {
+		//返回值!= 0，表示不存在该文件；所以就会使用老式的方法去执行/linuxrc，也就是传统的initrd格式
+		ramdisk_execute_command = NULL;
+		prepare_namespace();
+	}
+
+	/*
+	 * Ok, we have completed the initial bootup, and
+	 * we're essentially up and running. Get rid of the
+	 * initmem segments and start the user-mode stuff..
+	 */
+
+	init_post();
+	return 0;
+}
+
+从上面的代码可知，根据rootfs中是否存在ramdisk_execute_command文件，即/init文件，处理流程分支为Image-initrd和GPIO-initrd。
+
+	3.2.2.1 GPIO-initrd处理
+我们首先看看GPIO-initrd启动的完整代码，有上面介绍的kernel_init函数可知，该过程从init_post函数开始：
+
+static noinline int init_post(void)
+{
+	//省略跟initrd无关的代码
+......
+//假如变量ramdisk_execute_command被设置；
+//ramdisk_execute_command一般在函数kernel_init被设置为/init
+	if (ramdisk_execute_command) {
+		run_init_process(ramdisk_execute_command);
+		printk(KERN_WARNING "Failed to execute %s\n",
+				ramdisk_execute_command);
+	}
+
+	/*
+	 * We try each of these until one succeeds.
+	 *
+	 * The Bourne shell can be used instead of init if we are
+	 * trying to recover a really broken machine.
+	 */
+//由于一些历史原因，有一些不同的init程序文件存在，我们会依次测试每一种合理的
+//可能性；如果run_init_process执行某个文件成功，则不会返回了，也就从内核状态
+//调用用户态程序，然后返回到了用户态。关于细节请看run_init_process函数的实现。
+	if (execute_command) {
+		run_init_process(execute_command);
+		printk(KERN_WARNING "Failed to execute %s.  Attempting "
+					"defaults...\n", execute_command);
+	}
+	run_init_process("/sbin/init");
+	run_init_process("/etc/init");
+	run_init_process("/bin/init");
+	run_init_process("/bin/sh");
+
+	panic("No init found.  Try passing init= option to kernel. "
+	      "See Linux Documentation/init.txt for guidance.");
+}
+
+
+run_init_process函数定义如下，该函数只是一个对kernel_execve函数的简单wrap。
+
+static void run_init_process(const char *init_filename)
+{
+	argv_init[0] = init_filename;
+	kernel_execve(init_filename, argv_init, envp_init);
+}
+
+kernel_execve函数的定义如下：
+
+int kernel_execve(const char *filename,
+		  const char *const argv[],
+		  const char *const envp[])
+{
+	struct pt_regs regs;
+	int ret;
+
+	memset(&regs, 0, sizeof(struct pt_regs));
+
+    //加载并执行一个新的可执行程序
+	ret = do_execve(filename,
+			(const char __user *const __user *)argv,
+			(const char __user *const __user *)envp, &regs);
+	if (ret < 0)
+		goto out;
+
+	/*
+	 * Save argc to the register structure for userspace.
+	 */
+//将do_execve的返回值存入regs.ARM_r0；
+//因为ARM规定，使用R0返回函数的执行结果。
+	regs.ARM_r0 = ret;
+
+	/*
+	 * We were successful.  We won't be returning to our caller, but
+	 * instead to user space by manipulating the kernel stack.
+	 */
+	asm(	"add	r0, %0, %1\n\t"
+		"mov	r1, %2\n\t"
+		"mov	r2, %3\n\t"
+		"bl	memmove\n\t"	/* copy regs to top of stack */
+		"mov	r8, #0\n\t"	/* not a syscall */
+		"mov	r9, %0\n\t"	/* thread structure */
+		"mov	sp, r0\n\t"	/* reposition stack pointer */
+		"b	ret_to_user"
+		:
+		: "r" (current_thread_info()),
+		  "Ir" (THREAD_START_SP - sizeof(regs)),
+		  "r" (&regs),
+		  "Ir" (sizeof(regs))
+		: "r0", "r1", "r2", "r3", "ip", "lr", "memory");
+
+ out:
+	return ret;
+}
+EXPORT_SYMBOL(kernel_execve);
+
+
+	3.2.2.2 Image-initrd处理
+为处理Image-initrd，首先将ramdisk_execute_command设置为NULL，然后调用prepare_namespace函数，如下面的代码所示：
+
+if (sys_access((const char __user *) ramdisk_execute_command, 0) != 0) {
+	//返回值!= 0，表示不存在该文件；所以就会使用老式的方法去执行/linuxrc，也就是传统的initrd格式
+	ramdisk_execute_command = NULL;
+	prepare_namespace();
+}
+
+
+
+/*
+ * Prepare the namespace - decide what/where to mount, load ramdisks, etc.
+ *
+ * 该函数完成很多工作，几乎是Image-initrd流程的全部工作：
+ * 0 这个步骤是有bootloader完成的：boot loader把内核以及initrd文件加载到内存的特定位置
+ * 1 内核将initrd的内容保存在rootfs下的/initrd.image文件中
+ * 2 内核将/initrd.image的内容读入/dev/ram0设备中
+ * 3 接着内核以可读写的方式把/dev/ram0设备挂载为原始的根文件系统
+ * 4 执行initrd上的/linuxrc文件
+ * 5 等待/linuxrc（linuxrc是通过另外一个进程去执行的，所以内核使用wait系统调用来等待linuxrc进程）执行完毕
+ * 6 将real root device mount到/root目录，且当前目录就是/root
+ * 7 由该函数倒数第二行将/root挂载到/。
+ *
+ * 但是该函数没有执行/sbin/init程序。该程序的执行实在init_post函数中，该函数实现比较巧妙：
+ * 1 首先看ramdisk_execute_command是否被设置，如果被设置，一般设置成/init；则/init作为第一个进程开始执行，就是CPIO-initrd
+ * 		中执行的步骤；
+ * 2 在就是看"/sbin/init"这个可执行文件
+ * 3 还会查看其它类似文件，具体请看init_post函数的实现。
+ *
+ * 由此可见，在内核3.0中，为支持Image-initrd，就会多执行image-initrd相关的操作，最后也会到init_post函数；
+ * 而CPIO-image会直接调用init_post函数；在init_post函数中根据ramdisk_execute_command参数是否被设置来决定执行：
+ * /init（包含在CPIO-initrd）还是/sbin/init（包含在real root device）。
+ *
+ *
+ * 由此可见，CPIO-initrd在/init就交出了控制权，而Image-initrd在/linuxrc暂时交出控制权，然后又回收，最后将控制权交给了/sbin/init。
+ *
+ */
+void __init prepare_namespace(void)
+{
+	int is_floppy;
+
+	if (root_delay) {
+		printk(KERN_INFO "Waiting %dsec before mounting root device...\n",
+		       root_delay);
+		ssleep(root_delay);
+	}
+
+	/*
+	 * wait for the known devices to complete their probing
+	 *
+	 * Note: this is a potential source of long boot delays.
+	 * For example, it is not atypical to wait 5 seconds here
+	 * for the touchpad of a laptop to initialize.
+	 */
+	wait_for_device_probe();
+
+	//软件磁盘阵列相关的设备: /dev/md0
+	md_run_setup();
+
+	if (saved_root_name[0]) {
+		root_device_name = saved_root_name;
+		//如果root device是mtd或者ubi
+		if (!strncmp(root_device_name, "mtd", 3) ||
+		    !strncmp(root_device_name, "ubi", 3)) {
+			mount_block_root(root_device_name, root_mountflags);
+			goto out;
+		}
+		ROOT_DEV = name_to_dev_t(root_device_name);
+		//去掉传给kernel的root参数的前5个字符：/dev/
+		if (strncmp(root_device_name, "/dev/", 5) == 0)
+			root_device_name += 5;
+	}
+
+	/*
+	 * 加initrd加载到内存，具体的工作分为如下几步：
+	 * 0 这个步骤是有bootloader完成的：boot loader把内核以及initrd文件加载到内存的特定位置
+	 * 1 内核将initrd的内容保存在rootfs下的/initrd.image文件中
+	 * 2 内核将/initrd.image的内容读入/dev/ram0设备中
+	 * 3 接着内核以可读写的方式把/dev/ram0设备挂载为原始的根文件系统
+	 * 4 执行initrd上的/linuxrc文件
+	 * 5 等待/linuxrc（linuxrc是通过另外一个进程去执行的，所以内核使用wait系统调用来等待linuxrc进程）执行完毕
+	 * 6 将real root device mount到/root目录，且当前目录就是/root
+	 */
+	if (initrd_load())
+		goto out;
+
+	/* wait for any asynchronous scanning to complete */
+	if ((ROOT_DEV == 0) && root_wait) {
+		printk(KERN_INFO "Waiting for root device %s...\n",
+			saved_root_name);
+		while (driver_probe_done() != 0 ||
+			(ROOT_DEV = name_to_dev_t(saved_root_name)) == 0)
+			msleep(100);
+		async_synchronize_full();
+	}
+
+	is_floppy = MAJOR(ROOT_DEV) == FLOPPY_MAJOR;
+
+	if (is_floppy && rd_doload && rd_load_disk(0))
+		ROOT_DEV = Root_RAM0;
+
+	mount_root();
+out:
+	devtmpfs_mount("dev");
+
+	//将real root device挂载到/；原先挂载在/root下。
+//至此，我们已经完成image-initrd的挂载、执行其中的/linuxrc并等待结束、通过mount_root将
+//real root device挂载到/root目录、如果可能就将/dev/ram挂载/root/initrd等一系列工作。
+//其实到此我们已经完成image-initrd相关的所有工作；
+//下面一句就是将/root（real root device）挂载到/目录，也就完成了image-initrd的中间步骤。
+	sys_mount(".", "/", NULL, MS_MOVE, NULL);
+	sys_chroot((const char __user __force *)".");
+}
+
+
+接着，我们来详细看看initrd_load函数的细节：
+
+int __init initrd_load(void)
+{
+	if (mount_initrd) {
+        //创建/dev/ram这个设备节点
+		create_dev("/dev/ram", Root_RAM0);
+		/*
+		 * Load the initrd data into /dev/ram0. Execute it as initrd
+		 * unless /dev/ram0 is supposed to be our actual root device,
+		 * in that case the ram disk is just set up here, and gets
+		 * mounted in the normal path.
+		 */
+        //由上面的内核注释可以比较清楚地看出下面几句的含义，这样清晰的注释在内核并不多见
+        //首先通过rd_load_image函数将initrd image从/initrd.image加载到/dev/ram0
+        //接着判断如果/dev/ram0不是真正的根文件系统，执行if中的两个函数，其实就是
+        //image-initrd挂载的其他步骤，在分析handle_initrd的时候给出细节。
+		if (rd_load_image("/initrd.image") && ROOT_DEV != Root_RAM0) {
+			sys_unlink("/initrd.image");
+			handle_initrd();
+			return 1;
+		}
+	}
+	sys_unlink("/initrd.image");
+	return 0;
+}
+省略一些无关紧要的代码。
+/*
+ * 正确返回1；
+ */
+int __init rd_load_image(char *from)
+{
+	int res = 0;
+	int in_fd, out_fd;
+	unsigned long rd_blocks, devblocks;
+	int nblocks, i, disk;
+	char *buf = NULL;
+	unsigned short rotate = 0;
+	decompress_fn decompressor = NULL;
+#if !defined(CONFIG_S390) && !defined(CONFIG_PPC_ISERIES)
+	char rotator[4] = { '|' , '/' , '-' , '\\' };
+#endif
+
+    //【1】 分别打开存放initrd image的源文件和目的文件
+	out_fd = sys_open((const char __user __force *) "/dev/ram", O_RDWR, 0);
+	if (out_fd < 0)
+		goto out;
+
+	in_fd = sys_open(from, O_RDONLY, 0);
+	if (in_fd < 0)
+		goto noclose_input;
+
+	/*【2】
+	 * 该函数只是用来验证initrd image，该image目前存储在/initrd.image文件中：
+	 * 1 returns the number of blocks to read for a non-compressed image
+	 * 2 returns 0 if the image is a compressed image,
+	 * 3 returns -1 if an image with the right magic numbers could not be found.
+	 */
+	nblocks = identify_ramdisk_image(in_fd, rd_image_start, &decompressor);
+	if (nblocks < 0)
+		goto done;
+
+	/*【3】
+	 * /initrd.image中存储的是压缩格式的initrd image。
+	 * 将in_fd（/initrd.image）中的内容解压到out_fd（/dev/ram）。
+	 */
+	if (nblocks == 0) {
+		/*
+		 * 如果initrd image是压缩的，通过crd_load函数将image解压到out_fd
+		 */
+		if (crd_load(in_fd, out_fd, decompressor) == 0)
+			goto successful_load;
+		goto done;
+	}
+
+    //【4】 如果initrd是非压缩的，将其从/initrd.image拷贝到/dev/ram中
+	/*
+	 * NOTE NOTE: nblocks is not actually blocks but
+	 * the number of kibibytes of data to load into a ramdisk.
+	 * So any ramdisk block size that is a multiple of 1KiB should
+	 * work when the appropriate ramdisk_blocksize is specified
+	 * on the command line.
+	 *
+	 * The default ramdisk_blocksize is 1KiB and it is generally
+	 * silly to use anything else, so make sure to use 1KiB
+	 * blocksize while generating ext2fs ramdisk-images.
+	 *
+	 * 该函数返回out_fd中的块的个数，即/dev/ram的块的个数。
+	 */
+	if (sys_ioctl(out_fd, BLKGETSIZE, (unsigned long)&rd_blocks) < 0)
+		rd_blocks = 0;
+	else
+		rd_blocks >>= 1;
+
+	/*
+	 * 如果将in_fd（/initrd.image）中的块的数目大于out_fd（/dev/ram）中的一半，出错。
+	 * 如果块的个数大于块的大小的一半时，出错。
+	 */
+	if (nblocks > rd_blocks) {
+		printk("RAMDISK: image too big! (%dKiB/%ldKiB)\n",
+		       nblocks, rd_blocks);
+		goto done;
+	}
+
+	/*
+	 * OK, time to copy in the data
+	 */
+	if (sys_ioctl(in_fd, BLKGETSIZE, (unsigned long)&devblocks) < 0)
+		devblocks = 0;
+	else
+		devblocks >>= 1;
+
+	if (strcmp(from, "/initrd.image") == 0)
+		devblocks = nblocks;
+
+	if (devblocks == 0) {
+		printk(KERN_ERR "RAMDISK: could not determine device size\n");
+		goto done;
+	}
+
+	buf = kmalloc(BLOCK_SIZE, GFP_KERNEL);
+	if (!buf) {
+		printk(KERN_ERR "RAMDISK: could not allocate buffer\n");
+		goto done;
+	}
+
+	printk(KERN_NOTICE "RAMDISK: Loading %dKiB [%ld disk%s] into ram disk... ",
+		nblocks, ((nblocks-1)/devblocks)+1, nblocks>devblocks ? "s" : "");
+	for (i = 0, disk = 1; i < nblocks; i++) {
+		if (i && (i % devblocks == 0)) {
+			printk("done disk #%d.\n", disk++);
+			rotate = 0;
+			if (sys_close(in_fd)) {
+				printk("Error closing the disk.\n");
+				goto noclose_input;
+			}
+			change_floppy("disk #%d", disk);
+			in_fd = sys_open(from, O_RDONLY, 0);
+			if (in_fd < 0)  {
+				printk("Error opening disk.\n");
+				goto noclose_input;
+			}
+			printk("Loading disk #%d... ", disk);
+		}
+
+		/*【5】将initrd从/initrd.image拷贝到/dev/ram的两行核心函数，【4】和【5】之间全部是合法性判断
+		 * 对拷两个文件，似乎没有什么好办法：都是从一个文件读进一个buffer，然后从buffer写入另一个文件。
+		 */
+		sys_read(in_fd, buf, BLOCK_SIZE);
+		sys_write(out_fd, buf, BLOCK_SIZE);
+#if !defined(CONFIG_S390) && !defined(CONFIG_PPC_ISERIES)
+		if (!(i % 16)) {
+			printk("%c\b", rotator[rotate & 0x3]);
+			rotate++;
+		}
+#endif
+	}
+	printk("done.\n");
+
+successful_load:
+	res = 1;
+done:
+	sys_close(in_fd);
+noclose_input:
+	sys_close(out_fd);
+out:
+	kfree(buf);
+	/*【6】
+	 * 为什么需要删除"/dev/ram"
+	 * 因为在后续函数handle_initrd中，重新调用了create_dev("/dev/root.old", Root_RAM0);
+	 */
+	sys_unlink((const char __user __force *) "/dev/ram");
+	return res;
+}
+/*
+ * 该函数主要完成将Root_RAM0挂载到/目录，并创建一个进程执行/linuxrc，并等待其结束。
+ * 在linuxrc结束后，通过mount_root挂载real root device到/root；
+ * 如果存在/root/initrd，将Root_RAM0挂载到/root/initrd下面；否则卸载Root_RAM0。
+ */
+static void __init handle_initrd(void)
+{
+	int error;
+	int pid;
+
+	real_root_dev = new_encode_dev(ROOT_DEV);
+	create_dev("/dev/root.old", Root_RAM0);
+
+	/*
+	 * 注意注释：
+	 * mount initrd on rootfs' /root
+	 */
+	mount_block_root("/dev/root.old", root_mountflags & ~MS_RDONLY);
+	sys_mkdir("/old", 0700);
+	root_fd = sys_open("/", 0, 0);
+	old_fd = sys_open("/old", 0, 0);
+	/* move initrd over / and chdir/chroot in initrd root */
+	/*
+	 * 下面两句合起来就是将Root_RAM0设备挂载到/目录
+	 * 亦即完成了initrd的挂载到/的任务。
+	 *
+	 * /root目录中内容就是Root_RAM0中的内容，是有：
+	 * 		create_dev("/dev/root.old", Root_RAM0);  和
+	 * 		mount_block_root("/dev/root.old", root_mountflags & ~MS_RDONLY);
+	 * 		完成的。
+	 */
+	sys_chdir("/root");
+	sys_mount(".", "/", NULL, MS_MOVE, NULL);
+	sys_chroot(".");
+
+	/*到此，将initrd挂载到了/目录下。下面的任务就是启动一个内核线程来执行/linuxrc。*/
+
+	/*
+	 * In case that a resume from disk is carried out by linuxrc or one of
+	 * its children, we need to tell the freezer not to wait for us.
+	 */
+	current->flags |= PF_FREEZER_SKIP;
+
+	/*
+	 * 通过一个kernel进程去加载/linuxrc程序，使其在应用层运行。
+	 * 内核进程kernel_thread仅仅完成可执行程序的加载工作，类似sys_execve系统调用。
+	 */
+	pid = kernel_thread(do_linuxrc, "/linuxrc", SIGCHLD);
+
+	/*
+	 * Image-initrd和CPIO-initrd的其中一个区别是：
+	 * CPIO-initrd在启动/init就不再等待它的执行完成，换言之，一旦启动/init，就把控制权交给了/init
+	 * 而，Image-initrd中，启动/linuxrc后，内核需要等待/linuxrc执行完成，然后内核还有其它事情要做。
+	 */
+	if (pid > 0)
+		while (pid != sys_wait4(-1, NULL, 0, NULL))	//wait4函数用来等待子进程的推出。
+			yield();
+
+	current->flags &= ~PF_FREEZER_SKIP;
+
+	/* move initrd to rootfs' /old */
+	sys_fchdir(old_fd);
+	sys_mount("/", ".", NULL, MS_MOVE, NULL);
+	/* switch root and cwd back to / of rootfs */
+	sys_fchdir(root_fd);
+	sys_chroot(".");
+	sys_close(old_fd);
+	sys_close(root_fd);
+
+	/*
+	 * 加入initrd是real root device
+	 */
+	if (new_decode_dev(real_root_dev) == Root_RAM0) {
+		sys_chdir("/old");
+		return;
+	}
+
+	ROOT_DEV = new_decode_dev(real_root_dev);
+	mount_root();
+
+	printk(KERN_NOTICE "Trying to move old root to /initrd ... ");
+	error = sys_mount("/old", "/root/initrd", NULL, MS_MOVE, NULL);
+	if (!error)
+		printk("okay\n");
+	else {
+		int fd = sys_open("/dev/root.old", O_RDWR, 0);
+		if (error == -ENOENT)
+			printk("/initrd does not exist. Ignored.\n");
+		else
+			printk("failed\n");
+		printk(KERN_NOTICE "Unmounting old root\n");
+		sys_umount("/old", MNT_DETACH);
+		printk(KERN_NOTICE "Trying to free ramdisk memory ... ");
+		if (fd < 0) {
+			error = fd;
+		} else {
+			error = sys_ioctl(fd, BLKFLSBUF, 0);
+			sys_close(fd);
+		}
+		printk(!error ? "okay\n" : "failed\n");
+	}
+}
+
+
+总结：Image-initrd相较于CPIO-initrd，多做了中间一些步骤，这些步骤包括：
+1 将initrd拷贝（解压）到/dev/ram；
+2 将/dev/ram挂载到/；
+3 内核创建新的进程用于执行/linuxrc，并等待其结束；
+4 挂载real root device到/root；
+5 如果存在/root/initrd，将/dev/ram挂载到/root/initrd；否则释放/root/initrd；
+6 最后将/root挂载到/目录。
+在完成上述这些步骤回到了一个共同的终点：init_post函数。它们也有着一个共同的起点：kernel_init。这些中间步骤，CPIO-initrd是不需要的，所以现在建议使用CPIO-initrd，亦即常说的initramfs。
+在到了终点init_post函数后，CPIO-image执行/init；而Image-initrd执行/sbin/init，来创建1号进程。
